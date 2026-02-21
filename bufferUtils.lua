@@ -4,19 +4,24 @@
 -- Values
 local intSizes = { 8, 16, 32 }
 
-local accessedTypes = { "boolean", "number", "string", "Vector3", "CFrame", "table", "buffer" }
+local accessedTypes = { "boolean", "number", "string", "Vector3", "Vector2", "CFrame", "table", "buffer", "Enum", "EnumItem", "Instance" }
 
 local indexes = {
 	boolean = 0,
 	int8 = 1,
 	int16 = 2,
 	int32 = 3,
-	float = 4,
-	["string"] = 5,
-	["Vector3"] = 6,
-	["CFrame"] = 7,
-	["table"] = 8,
-	["buffer"] = 9,
+	float32 = 4,
+	float64 = 5,
+	["string"] = 6,
+	["Vector3"] = 7,
+	["Vector2"] = 8,
+	["CFrame"] = 9,
+	["table"] = 10,
+	["buffer"] = 11,
+	["Enum"] = 12,
+	["EnumItem"] = 13,
+	["Instance"] = 14,
 }
 
 local sizes = {
@@ -24,10 +29,14 @@ local sizes = {
 	int8 = 8,
 	int16 = 16,
 	int32 = 32,
-	float = 32,
+	float32 = 32,
+	float64 = 64,
 	["string"] = 8,
-	["Vector3"] = 96,
-	["CFrame"] = 192,
+	["Vector3"] = 192,
+	["Vector2"] = 64,
+	["CFrame"] = 384,
+	["Enum"] = 10,
+	["EnumItem"] = 12
 }
 
 -- Functions
@@ -66,6 +75,17 @@ end
 local function writeFloat32(b: buffer, n: number, offset: number?)
 	offset = offset or 0
 	
+	if n == 0 then
+		local sign = if 1 / n == -math.huge then 1 else 0
+
+		for index = 0, 31 do
+			local bit = (index == 31) and sign or 0
+			buffer.writebits(b, offset + index, 1, bit)
+		end
+
+		return
+	end
+	
 	local sign = if n > 0 then 0 else 1
 	local exponent = math.floor(math.log(math.abs(n), 2))
 	local mantissa = math.abs(n) / (2 ^ exponent) - 1
@@ -82,6 +102,56 @@ local function writeFloat32(b: buffer, n: number, offset: number?)
 	for index = 0, 31 do
 		local bit = bit32.band(bit32.rshift(bits, index), 1)
 		buffer.writebits(b, offset + index, 1, bit)
+	end
+end
+
+--[=[
+	@param b buffer;
+	@param b number;
+	@param offset number?;
+	
+	@return ;
+	
+	Writes 64 bit float to a buffer with given in bits offset. Uses IEE-754
+	standard.
+]=]
+local function writeFloat64(b: buffer, n: number, offset: number?)
+	offset = offset or 0
+
+	if n == 0 then
+		local sign = if 1 / n == -math.huge then 1 else 0
+
+		for index = 0, 63 do
+			local bit = (index == 63) and sign or 0
+			buffer.writebits(b, offset + index, 1, bit)
+		end
+
+		return
+	end
+
+	local sign = (n < 0) and 1 or 0
+	local exponent = math.floor(math.log(math.abs(n), 2))
+	local mantissa = math.abs(n) / (2 ^ exponent) - 1
+
+	local exponentBits = exponent + 1023
+	local mantissaBits = math.floor(mantissa * 2^52 + 0.5)
+
+	local mantissaHighBits = math.floor(mantissaBits / 2^32)
+	local mantissaLowBits = mantissaBits % 2^32
+
+	local high =
+		bit32.lshift(sign, 31)
+		+ bit32.lshift(exponentBits, 20)
+		+ bit32.band(mantissaHighBits, 0xFFFFF)
+
+	for index = 0, 31 do
+		local bit = bit32.band(bit32.rshift(high, index), 1)
+		buffer.writebits(b, offset + index, 1, bit)
+	end
+
+	for index = 0, 31 do
+		local bit = bit32.band(bit32.rshift(mantissaLowBits, index), 1)
+		buffer.writebits(b, offset + 32 + index, 1, bit)
 	end
 end
 
@@ -146,6 +216,47 @@ end
 
 --[=[
 	@param b buffer;
+	@param offset number?;
+	
+	@return number;
+	
+	Reads some written in the buffer 64 bit float written using IEE-754
+	standard at some offset in bits.
+]=]
+local function readFloat64(b: buffer, offset: number?)
+	offset = offset or 0
+
+	local high = 0
+
+	for index = 0, 31 do
+		local bit = buffer.readbits(b, offset + index, 1)
+		high += bit * 2^index
+	end
+
+	local mantissaLow = 0
+
+	for index = 0, 31 do
+		local bit = buffer.readbits(b, offset + 32 + index, 1)
+		mantissaLow += bit * 2^index
+	end
+
+	local sign = bit32.rshift(high, 31)
+	local exponentBits = bit32.band(bit32.rshift(high, 20), 0x7FF)
+	local mantissaHigh = bit32.band(high, 0xFFFFF)
+
+	if exponentBits == 0 and mantissaHigh == 0 and mantissaLow == 0 then
+		return if sign == 1 then -0 else 0
+	end
+
+	local exponent = exponentBits - 1023
+	local mantissa = 1 + ((mantissaHigh * 2^32 + mantissaLow) / 2^52)
+	local value = mantissa * (2 ^ exponent)
+
+	return if sign == 1 then -value else value
+end
+
+--[=[
+	@param b buffer;
 	@param toCopy buffer;
 	@param offset number?;
 	
@@ -183,6 +294,25 @@ local function readCopiedBuffer(b: buffer, length: number, offset: number?): buf
 	return copiedBuffer
 end
 
+--[=[
+	@param inst Instance;
+	@param path { string };
+	
+	@return { string };
+	
+	Fills given table with given instance path. Be careful when use it from
+	client.
+]=]
+local function instancePath(inst: Instance, path: { string }): { string }
+	table.insert(path, inst.Name)
+
+	if inst == game or not inst.Parent then
+		return path
+	else
+		return instancePath(inst.Parent, path)
+	end
+end
+
 -- Vector3 To Buffer
 local vector3ToBuffer = {}
 
@@ -191,14 +321,14 @@ local vector3ToBuffer = {}
 	
 	@return buffer;
 	
-	Converts Vector3 to buffer. Every side threats as 32 bit floats.
+	Converts Vector3 to buffer. Every side threats as 64 bit float.
 ]=]
 function vector3ToBuffer.convert(v3: Vector3): buffer
 	local v3Buffer = buffer.create(12)
 	
-	writeFloat32(v3Buffer, v3.X, 0)
-	writeFloat32(v3Buffer, v3.Y, 32)
-	writeFloat32(v3Buffer, v3.Z, 64)
+	writeFloat64(v3Buffer, v3.X, 0)
+	writeFloat64(v3Buffer, v3.Y, 32)
+	writeFloat64(v3Buffer, v3.Z, 64)
 	
 	return v3Buffer
 end
@@ -211,7 +341,7 @@ end
 	@return ;
 	
 	Writes Vector3 in buffer at given in bits offset. Every side threats as
-	32 bit floats.
+	64 bit float.
 ]=]
 function vector3ToBuffer.write(b: buffer, v3: Vector3, offset: number?)
 	offset = offset or 0
@@ -220,9 +350,9 @@ function vector3ToBuffer.write(b: buffer, v3: Vector3, offset: number?)
 		error(string.format("buffer's length %d is not enough.", buffer.len(b) * 8))
 	end
 	
-	writeFloat32(b, v3.X, offset + 0)
-	writeFloat32(b, v3.Y, offset + 32)
-	writeFloat32(b, v3.Z, offset + 64)
+	writeFloat64(b, v3.X, offset + 0)
+	writeFloat64(b, v3.Y, offset + 32)
+	writeFloat64(b, v3.Z, offset + 64)
 end
 
 --[=[
@@ -236,11 +366,71 @@ end
 function vector3ToBuffer.read(b: buffer, offset: number?): Vector3
 	offset = offset or 0
 	
-	local x = readFloat32(b, offset + 0)
-	local y = readFloat32(b, offset + 32)
-	local z = readFloat32(b, offset + 64)
+	local x = readFloat64(b, offset + 0)
+	local y = readFloat64(b, offset + 32)
+	local z = readFloat64(b, offset + 64)
 	
 	return Vector3.xAxis * x + Vector3.yAxis * y + Vector3.zAxis * z
+end
+
+-- Vector2 To Buffer
+local vector2ToBuffer = {}
+
+--[=[
+	@param v2 Vector2;
+	
+	@return buffer;
+	
+	Converts Vector2 to buffer. Every side threats as 32 bit floats.
+]=]
+function vector2ToBuffer.convert(v2: Vector2): buffer
+	local v2Buffer = buffer.create(8)
+
+	writeFloat32(v2Buffer, v2.X, 0)
+	writeFloat32(v2Buffer, v2.Y, 32)
+
+	return v2Buffer
+end
+
+--[=[
+	@param b buffer;
+	@param v2 Vector2;
+	@param offset number?;
+	
+	@return ;
+	
+	Writes Vector2 to buffer. Every side threats as 32 bit floats.
+]=]
+function vector2ToBuffer.write(b: buffer, v2: Vector2, offset: number?)
+	offset = offset or 0
+
+	if buffer.len(b) * 8 - offset < 64 then
+		error(string.format("buffer's length %d is not enough.", buffer.len(b) * 8))
+	end
+
+	writeFloat32(b, v2.X, offset)
+	writeFloat32(b, v2.Y, offset + 32)
+end
+
+--[=[
+	@param b buffer;
+	@param offset number?;
+	
+	@return Vector2;
+	
+	Reads Vector2 from buffer. Every side threats as 32 bit floats.
+]=]
+function vector2ToBuffer.read(b: buffer, offset: number?): Vector2
+	offset = offset or 0
+
+	if buffer.len(b) * 8 - offset < 192 then
+		error(string.format("buffer's length %d is not enough.", buffer.len(b) * 8))
+	end
+
+	local x = readFloat32(b, offset)
+	local y = readFloat32(b, offset + 32)
+
+	return Vector2.xAxis * x + Vector2.yAxis * y
 end
 
 -- CFrame To Buffer
@@ -251,17 +441,19 @@ local cframeToBuffer = {}
 	
 	@return buffer;
 	
-	Converts CFrame to buffer. Every side threats as 32 bit floats.
+	Converts CFrame to buffer. Every side threats as 64 bit float.
 ]=]
 function cframeToBuffer.convert(cf: CFrame): buffer
 	local cfBuffer = buffer.create(24)
 	
-	writeFloat32(cfBuffer, cf.Position.X, 0)
-	writeFloat32(cfBuffer, cf.Position.Y, 32)
-	writeFloat32(cfBuffer, cf.Position.Z, 64)
-	writeFloat32(cfBuffer, cf.Rotation.Position.X, 96)
-	writeFloat32(cfBuffer, cf.Rotation.Position.Y, 128)
-	writeFloat32(cfBuffer, cf.Rotation.Position.Z, 160)
+	local rx, ry, rz = cf:ToEulerAnglesXYZ()
+	
+	writeFloat64(cfBuffer, cf.Position.X, 0)
+	writeFloat64(cfBuffer, cf.Position.Y, 32)
+	writeFloat64(cfBuffer, cf.Position.Z, 64)
+	writeFloat64(cfBuffer, rx, 96)
+	writeFloat64(cfBuffer, ry, 128)
+	writeFloat64(cfBuffer, rz, 160)
 	
 	return cfBuffer
 end
@@ -274,7 +466,7 @@ end
 	@return buffer;
 	
 	Writes CFrame to some buffer at given offset in bits. Every side
-	threats as 32 bit floats.
+	threats as 64 bit float.
 ]=]
 function cframeToBuffer.write(b: buffer, cf: CFrame, offset: number?)
 	offset = offset or 0
@@ -283,12 +475,14 @@ function cframeToBuffer.write(b: buffer, cf: CFrame, offset: number?)
 		error(string.format("buffer's length %d is not enough.", buffer.len(b) * 8))
 	end
 	
-	writeFloat32(b, cf.Position.X, offset + 0)
-	writeFloat32(b, cf.Position.Y, offset + 32)
-	writeFloat32(b, cf.Position.Z, offset + 64)
-	writeFloat32(b, cf.Rotation.Position.X, offset + 96)
-	writeFloat32(b, cf.Rotation.Position.Y, offset + 128)
-	writeFloat32(b, cf.Rotation.Position.Z, offset + 160)
+	local rx, ry, rz = cf:ToEulerAnglesXYZ()
+	
+	writeFloat64(b, cf.Position.X, offset + 0)
+	writeFloat64(b, cf.Position.Y, offset + 32)
+	writeFloat64(b, cf.Position.Z, offset + 64)
+	writeFloat64(b, rx, offset + 96)
+	writeFloat64(b, ry, offset + 128)
+	writeFloat64(b, rz, offset + 160)
 end
 
 --[=[
@@ -302,12 +496,12 @@ end
 function cframeToBuffer.read(b: buffer, offset: number?): CFrame
 	offset = offset or 0
 	
-	local x = readFloat32(b, offset)
-	local y = readFloat32(b, offset + 32)
-	local z = readFloat32(b, offset + 64)
-	local rx = readFloat32(b, offset + 96)
-	local ry = readFloat32(b, offset + 128)
-	local rz = readFloat32(b, offset + 160)
+	local x = readFloat64(b, offset)
+	local y = readFloat64(b, offset + 32)
+	local z = readFloat64(b, offset + 64)
+	local rx = readFloat64(b, offset + 96)
+	local ry = readFloat64(b, offset + 128)
+	local rz = readFloat64(b, offset + 160)
 	
 	return CFrame.new(x, y, z) * CFrame.Angles(rx, ry, rz)
 end
@@ -401,11 +595,144 @@ function stringToBuffer.read(b: buffer, scopeOffset: number?, offset: number?): 
 	return buffer.tostring(strBuffer)
 end
 
+-- Enum To Buffer
+local enumToBuffer = {}
+enumToBuffer.enums = Enum:GetEnums()
+
+--[=[
+	@param enum Enum;
+	
+	@return buffer;
+	
+	Converts given enum to buffer.
+]=]
+function enumToBuffer.convert(enum: Enum): buffer
+	local indexOfEnum = table.find(enumToBuffer.enums, enum)
+	if not indexOfEnum then error("No such Enum.") end
+
+	local enumBuffer = buffer.create(2)
+	buffer.writebits(enumBuffer, 0, 10, indexOfEnum)
+
+	return enumBuffer
+end
+
+--[=[
+	@param b buffer;
+	@param enum Enum;
+	@param offset number?;
+	
+	@return ;
+	
+	Writes given enum to buffer at given offset.
+]=]
+function enumToBuffer.write(b: buffer, enum: Enum, offset: number?)
+	offset = offset or 0
+
+	if buffer.len(b) * 8 - offset < 10 then
+		error(string.format("buffer's length %d is not enough.", buffer.len(b) * 8))
+	end
+
+	local indexOfEnum = table.find(enumToBuffer.enums, enum)
+	if not indexOfEnum then error("No such Enum.") end
+
+	buffer.writebits(b, offset, 10, indexOfEnum)
+end
+
+--[=[
+	@param b buffer;
+	@param offset number?;
+	
+	@return Enum;
+	
+	Reads enum from buffer at given offset.
+]=]
+function enumToBuffer.read(b: buffer, offset: number?): Enum
+	offset = offset or 0
+
+	if buffer.len(b) * 8 - offset < 10 then
+		error(string.format("buffer's length %d is not enough.", buffer.len(b) * 8))
+	end
+
+	local indexOfEnum = buffer.readbits(b, offset, 10)
+
+	return enumToBuffer.enums[indexOfEnum]
+end
+
+-- EnumItem To Buffer
+local enumItemToBuffer = {}
+enumItemToBuffer.enumsValues = {} :: { EnumItem }
+
+for _, enum in ipairs(Enum:GetEnums()) do
+	for _, enumItem in ipairs(enum:GetEnumItems()) do
+		table.insert(enumItemToBuffer.enumsValues, enumItem)
+	end
+end
+
+--[=[
+	@param enumItem EnumItem;
+	
+	@return buffer;
+	
+	Converts given enumItem item to buffer.
+]=]
+function enumItemToBuffer.convert(enumItem: EnumItem): buffer
+	local indexOfEnumItem = table.find(enumItemToBuffer.enumsValues, enumItem)
+	if not indexOfEnumItem then error("No such EnumItem.") end
+
+	local enumItemBuffer = buffer.create(2)
+	buffer.writebits(enumItemBuffer, 0, 12, indexOfEnumItem)
+
+	return enumItemBuffer
+end
+
+--[=[
+	@param b buffer;
+	@param enumItem EnumItem;
+	@param offset number?;
+	
+	@return ;
+	
+	Writes given enumItem to buffer at given offset.
+]=]
+function enumItemToBuffer.write(b: buffer, enumItem: EnumItem, offset: number?)
+	offset = offset or 0
+
+	if buffer.len(b) * 8 - offset < 12 then
+		error(string.format("buffer's length %d is not enough.", buffer.len(b) * 8))
+	end
+
+	local indexOfEnumItem = table.find(enumItemToBuffer.enumsValues, enumItem)
+	if not indexOfEnumItem then error("No such EnumItem.") end
+
+	buffer.writebits(b, offset, 12, indexOfEnumItem)
+end
+
+--[=[
+	@param b buffer;
+	@param offset number?;
+	
+	@return EnumItem;
+	
+	Reads some enumItem from a given buffer at given in bits offset.
+]=]
+function enumItemToBuffer.read(b: buffer, offset: number?): EnumItem
+	offset = offset or 0
+
+	if buffer.len(b) * 8 - offset < 12 then
+		error(string.format("buffer's length %d is not enough.", buffer.len(b) * 8))
+	end
+
+	local indexOfEnumItem = buffer.readbits(b, offset, 12)
+
+	return enumItemToBuffer.enumsValues[indexOfEnumItem]
+end
+
 -- Values
 local SCOPE_SIZE = 28
 
 -- Types
-export type t = { [boolean | string | number | Vector3 | CFrame | buffer]: boolean | string | number | Vector3 | CFrame | t | buffer }
+type accesed = boolean | string | number | Vector3 | Vector2 | CFrame | buffer | Enum | EnumItem | Instance
+export type t = { [accesed]: accesed | t }
 
 -- Table To Buffer functions
 
@@ -423,9 +750,31 @@ local function returnNumberSizeInBits(n: number)
 		end
 	end
 
-	warn(string.format("%d is out of bit size range: 8, 16, 32.", n))
+	warn(string.format("%d is out of bit size range: 8, 16, 32, 64.", n))
 
-	return 64
+	return 32
+end
+
+--[=[
+	@param n number;
+	
+	@return number;
+	
+	Returns numbers after float point as int.
+]=]
+local function returnAfterCommaAsInt(n: number): number
+	return if n % 1 == 0 then n else returnAfterCommaAsInt(n * 10)
+end
+
+--[=[
+	@param n number;
+	
+	@return number;
+	
+	Returns number's with float point size in bits.
+]=]
+local function returnFloatSizeInBits(n: number): number
+	return if returnAfterCommaAsInt(math.abs(n)) % 1 < 2^23 then 32 else 64
 end
 
 --[=[
@@ -444,21 +793,8 @@ local function checkAndReturnValueType(v: any): string
 	end
 
 	if vType == "number" then
-		if v % 1 ~= 0 then
-			return "float"
-		end
-
-		local bitSize = returnNumberSizeInBits(v)
-
-		if bitSize == 8 then
-			return "int8"
-		elseif bitSize == 16 then
-			return "int16"
-		elseif bitSize == 32 then
-			return "int32"
-		elseif bitSize == 64 then
-			return "int64"
-		end
+		return if v % 1 == 0 then string.format("int%d", returnNumberSizeInBits(v))
+			else string.format("float%d", returnFloatSizeInBits(v))
 	end
 
 	return vType
@@ -486,6 +822,8 @@ local function tableToBufferSize(t: t): (number, number, number)
 			size += stringToBuffer.size(key :: string) - 24
 		elseif keyType == "buffer" then
 			size += buffer.len(key :: buffer) * 8
+		elseif keyType == "Instance" then
+			size += tableToBufferSize(instancePath(key :: Instance, {}) :: t)
 		else
 			size += sizes[keyType :: string] :: number
 		end
@@ -496,6 +834,8 @@ local function tableToBufferSize(t: t): (number, number, number)
 			size += tableToBufferSize(value :: t)
 		elseif valueType == "buffer" then
 			size += buffer.len(value :: buffer) * 8
+		elseif valueType == "Instance" then
+			size += tableToBufferSize(instancePath(value :: Instance, {}) :: t)
 		else
 			size += sizes[valueType :: string] :: number
 		end
@@ -516,7 +856,7 @@ end
 	about what size is given key and how to transform it when reading.
 	Returns next scope offset and next value offset.
 ]=]
-local function writeKey(b: buffer, scopeOffset: number, offset: number, key: boolean | string | number | Vector3 | CFrame | buffer): (number, number)
+local function writeKey(b: buffer, scopeOffset: number, offset: number, key: accesed): (number, number)
 	local keyType = checkAndReturnValueType(key)
 	
 	local index = indexes[keyType]
@@ -526,6 +866,14 @@ local function writeKey(b: buffer, scopeOffset: number, offset: number, key: boo
 		size = stringToBuffer.size(key :: string) - 24
 	elseif keyType == "buffer" then
 		size = buffer.len(key :: buffer) * 8
+	elseif keyType == "Instance" then
+		size = 0
+
+		local pathToInstance = instancePath(key :: Instance, {})
+
+		for _, name in ipairs(pathToInstance) do
+			size += stringToBuffer.size(name)
+		end
 	else
 		size = sizes[keyType]
 	end
@@ -535,16 +883,31 @@ local function writeKey(b: buffer, scopeOffset: number, offset: number, key: boo
 	
 	if keyType == "string" then
 		stringToBuffer.write(b, key :: string, scopeOffset + 4, offset)
-	elseif keyType == "float" then
+	elseif keyType == "float32" then
 		writeFloat32(b, key :: number, offset)
+	elseif keyType == "float64" then
+		writeFloat64(b, key :: number, offset)
 	elseif keyType == "Vector3" then
 		vector3ToBuffer.write(b, key :: Vector3, offset)
+	elseif keyType == "Vector2" then
+		vector2ToBuffer.write(b, key :: Vector2, offset)
 	elseif keyType == "CFrame" then
 		cframeToBuffer.write(b, key :: CFrame, offset)
 	elseif keyType == "boolean" then
-		writeInt(b, key == true and 1 or 0, 1, offset)
+		buffer.writebits(b, offset, 1, key == true and 1 or 0)
 	elseif keyType == "buffer" then
 		copyBuffer(b, key :: buffer, offset)
+	elseif keyType == "Enum" then
+		enumToBuffer.write(b, key :: Enum, offset)
+	elseif keyType == "EnumItem" then
+		enumItemToBuffer.write(b, key :: EnumItem, offset)
+	elseif keyType == "Instance" then
+		local pathToInstance = instancePath(key :: Instance, {})
+
+		for _, name in ipairs(pathToInstance) do
+			stringToBuffer.write(b, name, offset)
+			offset += stringToBuffer.size(name)
+		end
 	else
 		writeInt(b, key :: number, size, offset)
 	end
@@ -564,7 +927,7 @@ end
 	about what size is given value and how to transform it when reading.
 	Returns next scope offset and next key offset.
 ]=]
-local function writeValue(b: buffer, scopeOffset: number, offset: number, value: boolean | string | number | Vector3 | CFrame | t | buffer): (number, number)
+local function writeValue(b: buffer, scopeOffset: number, offset: number, value: accesed | t): (number, number)
 	local valueType = checkAndReturnValueType(value)
 
 	local index = indexes[valueType]
@@ -576,6 +939,14 @@ local function writeValue(b: buffer, scopeOffset: number, offset: number, value:
 		size = tableToBufferSize(value :: t)
 	elseif valueType == "buffer" then
 		size = buffer.len(value :: buffer) * 8
+	elseif valueType == "Instance" then
+		size = 0
+
+		local pathToInstance = instancePath(value :: Instance, {})
+
+		for _, name in ipairs(pathToInstance) do
+			size += stringToBuffer.size(name)
+		end
 	else
 		size = sizes[valueType]
 	end
@@ -585,14 +956,18 @@ local function writeValue(b: buffer, scopeOffset: number, offset: number, value:
 	
 	if valueType == "string" then
 		stringToBuffer.write(b, value :: string, scopeOffset + 4, offset)
-	elseif valueType == "float" then
+	elseif valueType == "float32" then
 		writeFloat32(b, value :: number, offset)
+	elseif valueType == "float64" then
+		writeFloat64(b, value :: number, offset)
 	elseif valueType == "Vector3" then
 		vector3ToBuffer.write(b, value :: Vector3, offset)
+	elseif valueType == "Vector2" then
+		vector2ToBuffer.write(b, value :: Vector2, offset)
 	elseif valueType == "CFrame" then
 		cframeToBuffer.write(b, value :: CFrame, offset)
 	elseif valueType == "boolean" then
-		writeInt(b, value == true and 1 or 0, 1, offset)
+		buffer.writebits(b, offset, 1, value == true and 1 or 0)
 	elseif valueType == "table" then
 		local valueSize, valueScopesSize = tableToBufferSize(value :: t)
 		
@@ -607,6 +982,17 @@ local function writeValue(b: buffer, scopeOffset: number, offset: number, value:
 		end
 	elseif valueType == "buffer" then
 		copyBuffer(b, value :: buffer, offset)
+	elseif valueType == "Enum" then
+		enumToBuffer.write(b, value :: Enum, offset)
+	elseif valueType == "EnumItem" then
+		enumItemToBuffer.write(b, value :: EnumItem, offset)
+	elseif valueType == "Instance" then
+		local pathToInstance = instancePath(value :: Instance, {})
+
+		for _, name in ipairs(pathToInstance) do
+			stringToBuffer.write(b, name, offset)
+			offset += stringToBuffer.size(name)
+		end
 	else
 		writeInt(b, value :: number, size, offset)
 	end
@@ -728,11 +1114,38 @@ function tableToBuffer.read(b: buffer, scopesOffset: number?, offset: number?): 
 		elseif descriptor.keyIndex == indexes["CFrame"] then
 			key = cframeToBuffer.read(b, offset)
 		elseif descriptor.keyIndex == indexes["boolean"] then
-			key = readInt(b, descriptor.keySize, offset) == 1
-		elseif descriptor.keyIndex == indexes["float"] then
+			key = buffer.readbits(b, offset, 1) == 1
+		elseif descriptor.keyIndex == indexes["float32"] then
 			key = readFloat32(b, offset)
+		elseif descriptor.keyIndex == indexes["float64"] then
+			key = readFloat64(b, offset)
 		elseif descriptor.keyIndex == indexes["buffer"] then
 			key = readCopiedBuffer(b, descriptor.keySize, offset)
+		elseif descriptor.keyIndex == indexes["Enum"] then
+			key = enumToBuffer.read(b, offset)
+		elseif descriptor.keyIndex == indexes["EnumItem"] then
+			key = enumItemToBuffer.read(b, offset)
+		elseif descriptor.keyIndex == indexes["Instance"] then
+			key = game
+
+			local border = 0
+
+			while border < descriptor.keySize do
+				local instanceName = stringToBuffer.read(b, offset)
+				key = key:FindFirstChild(instanceName) :: Instance
+
+				if not key then
+					break
+				end
+
+				border += stringToBuffer.size(instanceName)
+			end
+
+			if not key then
+				warn("Couldn't find valid instance, skipping key.")
+
+				continue
+			end
 		else
 			key = readInt(b, descriptor.keySize, offset)
 		end
@@ -747,13 +1160,40 @@ function tableToBuffer.read(b: buffer, scopesOffset: number?, offset: number?): 
 		elseif descriptor.valueIndex == indexes["CFrame"] then
 			value = cframeToBuffer.read(b, offset)
 		elseif descriptor.valueIndex == indexes["boolean"] then
-			value = readInt(b, descriptor.valueSize, offset) == 1
-		elseif descriptor.valueIndex == indexes["float"] then
+			value = buffer.readbits(b, offset, 1) == 1
+		elseif descriptor.valueIndex == indexes["float32"] then
 			value = readFloat32(b, offset)
+		elseif descriptor.valueIndex == indexes["float64"] then
+			value = readFloat64(b, offset)
 		elseif descriptor.valueIndex == indexes["table"] then
 			value = tableToBuffer.read(b, offset)
 		elseif descriptor.valueIndex == indexes["buffer"] then
 			value = readCopiedBuffer(b, descriptor.valueSize, offset)
+		elseif descriptor.valueIndex == indexes["Enum"] then
+			value = enumToBuffer.read(b, offset)
+		elseif descriptor.valueIndex == indexes["EnumItem"] then
+			value = enumItemToBuffer.read(b, offset)
+		elseif descriptor.valueIndex == indexes["Instance"] then
+			value = game
+
+			local border = 0
+
+			while border < descriptor.keySize do
+				local instanceName = stringToBuffer.read(b, offset)
+				value = value:FindFirstChild(instanceName) :: Instance
+
+				if not value then
+					break
+				end
+
+				border += stringToBuffer.size(instanceName)
+			end
+
+			if not value then
+				warn("Couldn't find valid instance, skipping key.")
+
+				continue
+			end
 		else
 			value = readInt(b, descriptor.valueSize, offset)
 		end
@@ -770,5 +1210,8 @@ return table.freeze({
 	tableToBuffer = tableToBuffer,
 	stringToBuffer = stringToBuffer,
 	vector3ToBuffer = vector3ToBuffer,
+	vector2ToBuffer = vector2ToBuffer,
 	cframeToBuffer = cframeToBuffer,
+	enumToBuffer = enumToBuffer,
+	enumItemToBuffer = enumItemToBuffer,
 })
